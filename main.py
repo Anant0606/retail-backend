@@ -27,10 +27,11 @@ class ConnectionManager:
         self.active_connections.append(websocket)
 
     def disconnect(self, websocket: WebSocket):
-        self.active_connections.remove(websocket)
+        if websocket in self.active_connections:
+            self.active_connections.remove(websocket)
 
     async def broadcast(self, message: dict):
-        for connection in self.active_connections:
+        for connection in list(self.active_connections):
             try:
                 await connection.send_json(message)
             except Exception:
@@ -70,20 +71,14 @@ store_state = {
 # 1. Edge Sync Endpoints
 @app.post("/api/v1/telemetry/edge")
 async def ingest_edge_telemetry(payload: dict):
-    """
-    Edge device sends aggregated JSON here.
-    Broadcasts instantly to connected dashboards via WebSocket.
-    """
     payload["server_received_at"] = datetime.utcnow().isoformat()
     
-    # Update state based on event type
     event_type = payload.get("event_type")
     if event_type == "QUEUE_UPDATE":
         store_state["counters"] = payload.get("payload", {}).get("counters", store_state["counters"])
     elif event_type == "INVENTORY_HEALTH":
         store_state["shelves"] = payload.get("payload", {}).get("shelves", store_state["shelves"])
         
-    # Broadcast to all connected WebSockets
     await manager.broadcast({"type": event_type, "data": payload})
     return {"status": "ACK", "message": "Telemetry synced"}
 
@@ -96,34 +91,36 @@ def get_live_state():
 @app.websocket("/ws/live-stream")
 async def websocket_endpoint(websocket: WebSocket):
     await manager.connect(websocket)
-    # Send current state immediately on connection
     await websocket.send_json({"type": "INITIAL_HYDRATION", "data": store_state})
     try:
         while True:
-            # Keep connection alive
             await websocket.receive_text()
     except WebSocketDisconnect:
         manager.disconnect(websocket)
 
-
-# Yeh background task har 2 second mein numbers update karega
+# 4. Background Telemetry Simulation Task
 async def simulate_live_edge_data():
     while True:
         await asyncio.sleep(2)
-        if hasattr(manager, "active_connections") and manager.active_connections:
-            # Footfall aur FPS mein live variation
+        if manager.active_connections:
+            # Random fluctuations match frontend structure
             delta = random.choice([-1, 0, 1, 2])
-            store_state["active_footfall"] = max(10, store_state.get("active_footfall", 42) + delta)
-            store_state["fps"] = round(random.uniform(27.8, 29.6), 1)
+            current_footfall = store_state["kpi"]["active_footfall"]
+            store_state["kpi"]["active_footfall"] = max(10, current_footfall + delta)
             
-            # Subscribed frontend ko live data bhejna
+            # Fluctuate FPS & Wi-Fi in node_status
+            store_state["node_status"]["fps"] = round(random.uniform(27.5, 29.8), 1)
+            store_state["node_status"]["wifi_dbm"] = random.randint(-65, -58)
+
+            # Fluctuate Queue counts
+            q1 = max(1, min(8, store_state["counters"][0]["queue"] + random.choice([-1, 0, 1])))
+            store_state["counters"][0]["queue"] = q1
+            store_state["counters"][0]["wait_time"] = f"{q1 * 90 // 60}m {q1 * 90 % 60}s"
+
+            # Broadcast updated state
             payload = {"type": "STATE_UPDATE", "data": store_state}
-            for connection in list(manager.active_connections):
-                try:
-                    await connection.send_json(payload)
-                except Exception:
-                    pass
-                    
+            await manager.broadcast(payload)
+
 @app.on_event("startup")
 async def startup_event():
     asyncio.create_task(simulate_live_edge_data())
