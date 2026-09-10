@@ -87,14 +87,34 @@ async def ingest_edge_telemetry(payload: dict):
 def get_live_state():
     return store_state
 
-# 3. Real-Time WebSocket for Vercel Frontend
+# 3. Real-Time WebSocket for Vercel Frontend & Interactive Commands
 @app.websocket("/ws/live-stream")
 async def websocket_endpoint(websocket: WebSocket):
     await manager.connect(websocket)
     await websocket.send_json({"type": "INITIAL_HYDRATION", "data": store_state})
     try:
         while True:
-            await websocket.receive_text()
+            # Client commands sunna
+            data_text = await websocket.receive_text()
+            try:
+                msg = json.loads(data_text)
+                if msg.get("action") == "OPEN_NEXT_COUNTER":
+                    # Standby counter ko activate karna
+                    for c in store_state["counters"]:
+                        if c["id"] == "03":
+                            c["status"] = "ACTIVE"
+                            c["queue"] = 1
+                            c["wait_time"] = "1m 15s"
+                            c["alert"] = "NORMAL"
+                    
+                    # Counter 01 se critical congestion alert settle karna
+                    store_state["counters"][0]["alert"] = "NORMAL"
+                    
+                    # Naya state broadcast karna
+                    payload = {"type": "STATE_UPDATE", "data": store_state}
+                    await manager.broadcast(payload)
+            except Exception:
+                pass
     except WebSocketDisconnect:
         manager.disconnect(websocket)
 
@@ -112,10 +132,11 @@ async def simulate_live_edge_data():
             store_state["node_status"]["fps"] = round(random.uniform(27.5, 29.8), 1)
             store_state["node_status"]["wifi_dbm"] = random.randint(-65, -58)
 
-            # Fluctuate Queue counts
-            q1 = max(1, min(8, store_state["counters"][0]["queue"] + random.choice([-1, 0, 1])))
-            store_state["counters"][0]["queue"] = q1
-            store_state["counters"][0]["wait_time"] = f"{q1 * 90 // 60}m {q1 * 90 % 60}s"
+            # Fluctuate Queue counts (agar counter 01 congested hai to queue handle kare)
+            if store_state["counters"][0]["status"] == "ACTIVE":
+                q1 = max(1, min(8, store_state["counters"][0]["queue"] + random.choice([-1, 0, 1])))
+                store_state["counters"][0]["queue"] = q1
+                store_state["counters"][0]["wait_time"] = f"{q1 * 90 // 60}m {q1 * 90 % 60}s"
 
             # Broadcast updated state
             payload = {"type": "STATE_UPDATE", "data": store_state}
