@@ -4,6 +4,7 @@ from pydantic import BaseModel
 from typing import List, Optional
 import json
 import asyncio
+import random
 from datetime import datetime
 
 app = FastAPI(title="EdgeRetail Analytics Gateway")
@@ -103,3 +104,26 @@ async def websocket_endpoint(websocket: WebSocket):
             await websocket.receive_text()
     except WebSocketDisconnect:
         manager.disconnect(websocket)
+
+
+# Yeh background task har 2 second mein numbers update karega
+async def simulate_live_edge_data():
+    while True:
+        await asyncio.sleep(2)
+        if hasattr(manager, "active_connections") and manager.active_connections:
+            # Footfall aur FPS mein live variation
+            delta = random.choice([-1, 0, 1, 2])
+            store_state["active_footfall"] = max(10, store_state.get("active_footfall", 42) + delta)
+            store_state["fps"] = round(random.uniform(27.8, 29.6), 1)
+            
+            # Subscribed frontend ko live data bhejna
+            payload = {"type": "STATE_UPDATE", "data": store_state}
+            for connection in list(manager.active_connections):
+                try:
+                    await connection.send_json(payload)
+                except Exception:
+                    pass
+                    
+@app.on_event("startup")
+async def startup_event():
+    asyncio.create_task(simulate_live_edge_data())
