@@ -1,26 +1,50 @@
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from typing import List, Optional
-import json
+from fastapi.middleware.cors import CORSMSMiddleware
+from datetime import datetime
 import asyncio
 import random
-from datetime import datetime
 
-app = FastAPI(title="EdgeRetail Analytics Gateway")
+app = FastAPI(title="EdgeRetail OS Gateway")
 
 app.add_middleware(
-    CORSMiddleware,
+    CORSMSMiddleware,
     allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Active WebSocket connections pool (Frontend clients)
+# Global Store State
+store_state = {
+    "node_status": {
+        "device_id": "Jetson-Orin-01",
+        "status": "ONLINE",
+        "fps": 5.5,
+        "wifi_rssi": -61,
+        "mode": "LIVE"
+    },
+    "kpi": {
+        "active_footfall": 1,
+        "in_count": 0,
+        "out_count": 0,
+        "avg_dwell_time": "12m 40s",
+        "restock_alerts": 1
+    },
+    "counters": [
+        {"id": "c1", "name": "COUNTER 01", "queue": 1, "wait_time": "1m 30s", "status": "ACTIVE"},
+        {"id": "c2", "name": "COUNTER 02", "queue": 0, "wait_time": "0m 00s", "status": "STANDBY"},
+        {"id": "c3", "name": "COUNTER 03", "queue": 0, "wait_time": "0m 00s", "status": "STANDBY"}
+    ],
+    "inventory": [
+        {"sku": "SKU-9921", "name": "Organic Almond Milk", "stock": 42, "threshold": 15, "status": "OPTIMAL"},
+        {"sku": "SKU-4412", "name": "Whole Wheat Bread", "stock": 8, "threshold": 12, "status": "LOW_STOCK"},
+        {"sku": "SKU-1089", "name": "Greek Yogurt 500g", "stock": 3, "threshold": 10, "status": "CRITICAL"}
+    ]
+}
+
 class ConnectionManager:
     def __init__(self):
-        self.active_connections: List[WebSocket] = []
+        self.active_connections: list[WebSocket] = []
 
     async def connect(self, websocket: WebSocket):
         await websocket.accept()
@@ -31,7 +55,7 @@ class ConnectionManager:
             self.active_connections.remove(websocket)
 
     async def broadcast(self, message: dict):
-        for connection in list(self.active_connections):
+        for connection in self.active_connections:
             try:
                 await connection.send_json(message)
             except Exception:
@@ -39,116 +63,64 @@ class ConnectionManager:
 
 manager = ConnectionManager()
 
-# In-Memory State for Instant Dashboard Hydration
-store_state = {
-    "node_status": {
-        "device_id": "Jetson-Orin-01",
-        "fps": 28.4,
-        "wifi_dbm": -62,
-        "battery_pct": 100,
-        "status": "LIVE"
-    },
-    "kpi": {
-        "active_footfall": 42,
-        "in_count": 318,
-        "out_count": 276,
-        "avg_dwell_time": "14m 20s",
-        "critical_alerts": 3
-    },
-    "counters": [
-        {"id": "01", "status": "ACTIVE", "queue": 5, "wait_time": "7m 30s", "alert": "CRITICAL_CONGESTION"},
-        {"id": "02", "status": "ACTIVE", "queue": 2, "wait_time": "2m 10s", "alert": "NORMAL"},
-        {"id": "03", "status": "STANDBY", "queue": 0, "wait_time": "0m", "alert": "NONE"}
-    ],
-    "shelves": [
-        {"aisle": "Aisle 2 - Snacks", "sku": "Parle-G", "fill_pct": 30, "status": "LOW_STOCK"},
-        {"aisle": "Aisle 4 - Dairy", "sku": "Amul Milk", "fill_pct": 85, "status": "OPTIMAL"},
-        {"aisle": "Aisle 1 - Edible Oils", "sku": "Sunflow 1L", "fill_pct": 0, "status": "OUT_OF_STOCK"}
-    ],
-    "events": []
-}
-
-# 1. Edge Sync Endpoints
+# 1. Edge Sync Endpoint (Directly updates store state from edge_tracker.py)
 @app.post("/api/v1/telemetry/edge")
 async def ingest_edge_telemetry(payload: dict):
-    payload["server_received_at"] = datetime.utcnow().isoformat()
-    
-    event_type = payload.get("event_type", "TELEMETRY_UPDATE")
-    
-    # Live footfall aur edge metrics sync karna
-    if "footfall_metrics" in payload:
-        metrics = payload["footfall_metrics"]
-        store_state["kpi"]["active_footfall"] = metrics.get("active_in_frame", store_state["kpi"]["active_footfall"])
-        store_state["kpi"]["in_count"] = metrics.get("in_count", store_state["kpi"]["in_count"])
-        store_state["kpi"]["out_count"] = metrics.get("out_count", store_state["kpi"]["out_count"])
-    
+    # Sync FPS
     if "fps" in payload:
         store_state["node_status"]["fps"] = payload["fps"]
 
-    # Har edge sync par poore store state ko Vercel clients par broadcast karein
+    # Sync Live Counts
+    if "footfall_metrics" in payload:
+        m = payload["footfall_metrics"]
+        store_state["kpi"]["active_footfall"] = m.get("active_in_frame", store_state["kpi"]["active_footfall"])
+        store_state["kpi"]["in_count"] = m.get("in_count", store_state["kpi"]["in_count"])
+        store_state["kpi"]["out_count"] = m.get("out_count", store_state["kpi"]["out_count"])
+
+        # Dynamic Queue mapping with active people detected
+        active = m.get("active_in_frame", 0)
+        store_state["counters"][0]["queue"] = active
+        store_state["counters"][0]["wait_time"] = f"{active * 45}s"
+        
+        # If queue >= 3, trigger alert mode
+        if active >= 3:
+            store_state["counters"][0]["status"] = "CONGESTED"
+        else:
+            store_state["counters"][0]["status"] = "ACTIVE"
+
+    # Dynamic Inventory Consumption when IN count increases
+    if payload.get("trigger_inventory_decrement", False):
+        for item in store_state["inventory"]:
+            if item["stock"] > 0 and random.random() > 0.4:
+                item["stock"] -= 1
+                if item["stock"] <= item["threshold"] and item["stock"] > 5:
+                    item["status"] = "LOW_STOCK"
+                elif item["stock"] <= 5:
+                    item["status"] = "CRITICAL"
+        
+        # Count restock alerts
+        critical_count = sum(1 for item in store_state["inventory"] if item["status"] in ["LOW_STOCK", "CRITICAL"])
+        store_state["kpi"]["restock_alerts"] = critical_count
+
+    # Broadcast updated state immediately to Next.js
     await manager.broadcast({"type": "STATE_UPDATE", "data": store_state})
-    return {"status": "ACK", "message": "Telemetry synced"}
+    return {"status": "ACK", "synced": True}
 
-# 2. REST Endpoint for initial state load
-@app.get("/api/v1/store/live-state")
-def get_live_state():
-    return store_state
-
-# 3. Real-Time WebSocket for Vercel Frontend & Interactive Commands
+# 2. WebSocket for Next.js Dashboard
 @app.websocket("/ws/live-stream")
 async def websocket_endpoint(websocket: WebSocket):
     await manager.connect(websocket)
-    await websocket.send_json({"type": "INITIAL_HYDRATION", "data": store_state})
+    # Send current state on connection
+    await websocket.send_json({"type": "INIT", "data": store_state})
     try:
         while True:
-            # Client commands sunna
-            data_text = await websocket.receive_text()
-            try:
-                msg = json.loads(data_text)
-                if msg.get("action") == "OPEN_NEXT_COUNTER":
-                    # Standby counter ko activate karna
-                    for c in store_state["counters"]:
-                        if c["id"] == "03":
-                            c["status"] = "ACTIVE"
-                            c["queue"] = 1
-                            c["wait_time"] = "1m 15s"
-                            c["alert"] = "NORMAL"
-                    
-                    # Counter 01 se critical congestion alert settle karna
-                    store_state["counters"][0]["alert"] = "NORMAL"
-                    
-                    # Naya state broadcast karna
-                    payload = {"type": "STATE_UPDATE", "data": store_state}
-                    await manager.broadcast(payload)
-            except Exception:
-                pass
+            data = await websocket.receive_json()
+            # Handle user actions from Dashboard (e.g. OPEN NEXT COUNTER)
+            if data.get("action") == "OPEN_COUNTER":
+                counter_id = data.get("counter_id", "c2")
+                for c in store_state["counters"]:
+                    if c["id"] == counter_id:
+                        c["status"] = "ACTIVE"
+                await manager.broadcast({"type": "STATE_UPDATE", "data": store_state})
     except WebSocketDisconnect:
         manager.disconnect(websocket)
-
-# 4. Background Telemetry Simulation Task
-async def simulate_live_edge_data():
-    while True:
-        await asyncio.sleep(2)
-        if manager.active_connections:
-            # Random fluctuations match frontend structure
-            delta = random.choice([-1, 0, 1, 2])
-            current_footfall = store_state["kpi"]["active_footfall"]
-            store_state["kpi"]["active_footfall"] = max(10, current_footfall + delta)
-            
-            # Fluctuate FPS & Wi-Fi in node_status
-            store_state["node_status"]["fps"] = round(random.uniform(27.5, 29.8), 1)
-            store_state["node_status"]["wifi_dbm"] = random.randint(-65, -58)
-
-            # Fluctuate Queue counts (agar counter 01 congested hai to queue handle kare)
-            if store_state["counters"][0]["status"] == "ACTIVE":
-                q1 = max(1, min(8, store_state["counters"][0]["queue"] + random.choice([-1, 0, 1])))
-                store_state["counters"][0]["queue"] = q1
-                store_state["counters"][0]["wait_time"] = f"{q1 * 90 // 60}m {q1 * 90 % 60}s"
-
-            # Broadcast updated state
-            payload = {"type": "STATE_UPDATE", "data": store_state}
-            await manager.broadcast(payload)
-
-@app.on_event("startup")
-async def startup_event():
-    asyncio.create_task(simulate_live_edge_data())
