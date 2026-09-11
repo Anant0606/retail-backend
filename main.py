@@ -73,13 +73,20 @@ store_state = {
 async def ingest_edge_telemetry(payload: dict):
     payload["server_received_at"] = datetime.utcnow().isoformat()
     
-    event_type = payload.get("event_type")
-    if event_type == "QUEUE_UPDATE":
-        store_state["counters"] = payload.get("payload", {}).get("counters", store_state["counters"])
-    elif event_type == "INVENTORY_HEALTH":
-        store_state["shelves"] = payload.get("payload", {}).get("shelves", store_state["shelves"])
-        
-    await manager.broadcast({"type": event_type, "data": payload})
+    event_type = payload.get("event_type", "TELEMETRY_UPDATE")
+    
+    # Live footfall aur edge metrics sync karna
+    if "footfall_metrics" in payload:
+        metrics = payload["footfall_metrics"]
+        store_state["kpi"]["active_footfall"] = metrics.get("active_in_frame", store_state["kpi"]["active_footfall"])
+        store_state["kpi"]["in_count"] = metrics.get("in_count", store_state["kpi"]["in_count"])
+        store_state["kpi"]["out_count"] = metrics.get("out_count", store_state["kpi"]["out_count"])
+    
+    if "fps" in payload:
+        store_state["node_status"]["fps"] = payload["fps"]
+
+    # Har edge sync par poore store state ko Vercel clients par broadcast karein
+    await manager.broadcast({"type": "STATE_UPDATE", "data": store_state})
     return {"status": "ACK", "message": "Telemetry synced"}
 
 # 2. REST Endpoint for initial state load
